@@ -72,6 +72,8 @@ class ConfigManager:
 class WorkerSignals(QObject):
     status_updated = pyqtSignal(str, str)
     info_received = pyqtSignal(dict)
+    # 【新增】专门用于触发UI弹窗的跨线程信号
+    auth_error_alert = pyqtSignal(str)
 
 
 class DrComClient(QMainWindow):
@@ -92,8 +94,10 @@ class DrComClient(QMainWindow):
         self.init_ui()
         self.create_tray()
 
+        # 绑定信号与槽
         self.signals.status_updated.connect(self.update_status_display)
         self.signals.info_received.connect(self.update_dashboard)
+        self.signals.auth_error_alert.connect(self.show_auth_error_box)  # 【新增】绑定弹窗逻辑
 
         if self.config.get("auto_login"):
             self.update_status_display("正在自动重连...", "#0078d4")
@@ -180,7 +184,6 @@ class DrComClient(QMainWindow):
         self.auto_start_cb.setChecked(self.config['auto_start'])
         self.auto_start_cb.toggled.connect(self.sync_settings)
 
-        # 添加弹簧，让两个勾选框分别靠左和靠右，实现完美对称
         cb_layout.addWidget(self.auto_login_cb)
         cb_layout.addStretch()
         cb_layout.addWidget(self.auto_start_cb)
@@ -228,11 +231,10 @@ class DrComClient(QMainWindow):
         layout.addStretch()
         layout.addWidget(self.logout_btn)
 
-        # --- 高亮署名栏 (Ma Jieru Badge) ---
+        # --- 高亮署名栏 ---
         footer_layout = QHBoxLayout()
         footer_layout.addStretch()
         self.author_badge = QLabel(" by: 飞行雪绒 ")
-        # 蓝色背景，白色文字，明显的圆角勋章感
         self.author_badge.setStyleSheet("""
             background-color: #0078d4; 
             color: white; 
@@ -286,26 +288,82 @@ class DrComClient(QMainWindow):
         self.status_label.setText(f"状态: {text}")
         self.status_label.setStyleSheet(f"color: {color}; font-weight: bold; border:none;")
 
+    # 【新增】处理严重的账号异常弹窗
+    def show_auth_error_box(self, error_msg):
+        # 取消自动登录，防止陷入错误死循环被拉黑
+        self.auto_login_cb.setChecked(False)
+        self.sync_settings()
+        # 弹出醒目警告
+        QMessageBox.critical(self, "认证拦截",
+                             f"无法登录校园网，系统拦截异常：\n\n【{error_msg}】\n\n请检查您的账号密码或网络状态。")
+        self.show()  # 如果软件在托盘，强行唤醒显示错误
+
     def check_is_online(self):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1.2);
+                s.settimeout(1.2)
                 s.connect(("223.5.5.5", 53))
             return True
         except:
             return False
 
+    # 【深度强化】Dr.COM 报错黑话翻译机
     def parse_drcom_jsonp(self, text):
         match = re.search(r'dr1003\((.*)\)', text)
         if match:
             try:
                 data = json.loads(match.group(1))
                 self.signals.info_received.emit(data)
-                if "online" in data.get("msga", "") or data.get("result") == 1: return True, "连接成功"
-                return False, data.get("msga", "验证失败")
+
+                # 提取网关原味报错信息
+                raw_msg = data.get("msga", "")
+
+                # 成功判断 (注意包含你发现的 clientip online)
+                if "online" in raw_msg or data.get("result") == 1:
+                    return True, "连接成功"
+
+                # 失败翻译
+                friendly_msg = raw_msg if raw_msg else "验证失败"
+                if "userid error2" in raw_msg:
+                    friendly_msg = "密码错误 (或账号异常)"
+                elif "userid error1" in raw_msg:
+                    friendly_msg = "账号不存在 (请检查后缀)"
+                elif "ldap auth error" in raw_msg:
+                    friendly_msg = "学校认证系统宕机"
+                elif "overdue" in raw_msg.lower():
+                    friendly_msg = "账号已欠费"
+                elif "ip_exist_error" in raw_msg or "已在线" in raw_msg:
+                    friendly_msg = "账号已在其他设备登录"
+
+                return False, friendly_msg
             except:
                 pass
         return False, "解析失败"
+
+    # 【加固】保留最真实的报错
+    def auto_carrier_discovery(self):
+        success, msg = self.send_login_request()
+        if success: return True, msg
+
+        last_error = msg
+
+        # 如果明确是密码错误，不需要再换运营商后缀测试了，直接阻断
+        if "密码" in msg or "欠费" in msg or "其他设备" in msg:
+            return False, msg
+
+        # 继续尝试后缀
+        for sfx in self.suffixes:
+            self.signals.status_updated.emit(f"检测线路 {sfx}...", "#f5a623")
+            ok, cur_msg = self.send_login_request(sfx)
+            if ok:
+                self.config['suffix'] = sfx
+                ConfigManager.save(self.config)
+                return True, f"重连成功 ({sfx})"
+            # 记录最新的有效报错
+            if cur_msg and "失败" not in cur_msg:
+                last_error = cur_msg
+
+        return False, last_error
 
     def send_login_request(self, suffix=None):
         u, p = self.config['user'], self.config['pwd']
@@ -316,19 +374,7 @@ class DrComClient(QMainWindow):
             res = requests.get(LOGIN_URL, params=params, timeout=5)
             return self.parse_drcom_jsonp(res.text)
         except:
-            return False, "连接网关失败"
-
-    def auto_carrier_discovery(self):
-        success, msg = self.send_login_request()
-        if success: return True, msg
-        for sfx in self.suffixes:
-            self.signals.status_updated.emit(f"检测线路 {sfx}...", "#f5a623")
-            ok, _ = self.send_login_request(sfx)
-            if ok:
-                self.config['suffix'] = sfx;
-                ConfigManager.save(self.config)
-                return True, f"重连成功 ({sfx})"
-        return False, "重连失败"
+            return False, "网关未响应，请检查是否连接校园WiFi"
 
     def handle_manual_login_btn(self):
         self.sync_settings()
@@ -336,7 +382,7 @@ class DrComClient(QMainWindow):
         threading.Thread(target=self._auto_login_task, daemon=True).start()
 
     def handle_logout(self):
-        self.live_timer.stop();
+        self.live_timer.stop()
         self.online_time_label.setText("00:00:00")
         threading.Thread(target=lambda: requests.get(LOGOUT_URL, params={"callback": "dr1003",
                                                                          "user_account": f"{self.config['user']}{self.config['suffix']}"}),
@@ -347,9 +393,14 @@ class DrComClient(QMainWindow):
         if not self.check_is_online():
             success, msg = self.auto_carrier_discovery()
             self.signals.status_updated.emit(msg, "#28a745" if success else "#d93025")
+
+            # 【新增】如果是账号/密码等硬性错误，触发弹窗报警
+            if not success and ("密码" in msg or "不存在" in msg or "欠费" in msg):
+                self.signals.auth_error_alert.emit(msg)
         else:
             self.signals.status_updated.emit("网络已就绪", "#28a745")
             self.send_login_request()
+
         self.start_monitoring_thread()
 
     def start_monitoring_thread(self):
@@ -358,6 +409,7 @@ class DrComClient(QMainWindow):
 
         def _loop():
             while True:
+                # 只有在断线秒连勾选时，才执行重连
                 if self.auto_login_cb.isChecked() and not self.check_is_online():
                     self.signals.status_updated.emit("断线秒连中...", "#0078d4")
                     success, msg = self.auto_carrier_discovery()
@@ -365,6 +417,9 @@ class DrComClient(QMainWindow):
                         self.signals.status_updated.emit("重连成功！", "#28a745")
                     else:
                         self.signals.status_updated.emit(f"重连失败", "#d93025")
+                        # 如果自动重连发现密码改了或者欠费了，立刻弹窗并停止自动重连
+                        if "密码" in msg or "不存在" in msg or "欠费" in msg:
+                            self.signals.auth_error_alert.emit(msg)
                 time.sleep(5)
 
         threading.Thread(target=_loop, daemon=True).start()
